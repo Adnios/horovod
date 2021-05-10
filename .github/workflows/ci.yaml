@@ -1104,7 +1104,7 @@ jobs:
 
   build-and-test-macos:
     name: "Build and Test (${{ matrix.name }}-macos)"
-    needs: [build-and-test]
+    needs: [validate-workflow]
     runs-on: macos-latest
     strategy:
       max-parallel: 3

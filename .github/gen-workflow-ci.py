@@ -388,7 +388,7 @@ def main():
             validate_workflow_job(),
             build_and_test_images(name='build-and-test', needs=['validate-workflow'], images=release_images, tests_per_image=tests_per_image, tests=tests),
             build_and_test_images(name='build-and-test-heads', needs=['build-and-test'], images=allhead_images, tests_per_image=tests_per_image, tests=tests),
-            build_and_test_macos(name='build-and-test-macos', needs=['build-and-test']),
+            build_and_test_macos(name='build-and-test-macos', needs=['validate-workflow']),
             trigger_buildkite_job(name='buildkite', needs=['build-and-test']),
             publish_unit_test_results(name='publish-test-results', needs=['build-and-test', 'build-and-test-heads', 'build-and-test-macos', 'buildkite'])
         )

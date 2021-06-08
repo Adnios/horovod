@@ -79,7 +79,7 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
   auto ops_param = static_cast<MpiOpsParam*>(param);
   auto first_tensor = ops_param->input_tensors[0].get();
   auto device = TensorUtil::GetDevice(first_tensor);
-  auto average = ops_param->average;
+  // auto average = ops_param->average;
   auto prescale_factor = ops_param->prescale_factor;
   auto postscale_factor = ops_param->postscale_factor;
   auto num_tensors = ops_param->input_tensors.size();
@@ -129,9 +129,10 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
         hvd_outputs.emplace_back(std::make_shared<MXTensor>(ops_param->output_tensors[i].get()));
       }
 
+      ReduceOp reduce_op = static_cast<ReduceOp>(ops_param->reduce_op_int);
       enqueue_result = EnqueueTensorAllreduces(
           hvd_contexts, hvd_tensors, hvd_outputs, ready_events, ops_param->op_names, device,
-          callbacks, (average) ? ReduceOp::AVERAGE : ReduceOp::SUM, prescale_factor, postscale_factor);
+          callbacks, reduce_op, prescale_factor, postscale_factor);
       break;
     case OperationType::ALLGATHER:
       enqueue_result = EnqueueTensorAllgather(
@@ -168,7 +169,7 @@ void DoHorovodOperation(void*, void* on_complete_ptr, void* param) {
 inline void PushHorovodOperation(OperationType op_type, NDArray* const * inputs,
                                  NDArray* const * outputs, const char* name,
                                  int priority, int num_tensors, int root_rank = -1,
-                                 bool average = true,
+                                 int divisor, int reduce_op_int,
                                  NDArray* splits = nullptr,
                                  NDArray* output_received_splits = nullptr,
                                  double prescale_factor = 1.0,
@@ -242,7 +243,7 @@ inline void PushHorovodOperation(OperationType op_type, NDArray* const * inputs,
 
   auto ops_param = CreateMpiOpsParam(std::move(input_copies), std::move(output_copies),
     std::move(outputs_vec), cpu_input_tensors, cpu_output_tensors, op_type, std::move(op_names), root_rank,
-    average, splits_tensor, received_splits_tensor, prescale_factor, postscale_factor);
+    divisor, reduce_op_int, splits_tensor, received_splits_tensor, prescale_factor, postscale_factor);
 
   // Not in-place
   if (!inplace) {
@@ -272,7 +273,7 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
   auto on_complete = *static_cast<CallbackOnComplete*>(on_complete_ptr);
   auto ops_param = static_cast<MpiOpsParam*>(param);
   auto device = CPU_DEVICE_ID;
-  auto average = ops_param->average;
+  // auto average = ops_param->average;
   auto prescale_factor = ops_param->prescale_factor;
   auto postscale_factor = ops_param->postscale_factor;
   auto num_tensors = ops_param->cpu_input_tensors.size();
@@ -316,9 +317,10 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
   Status enqueue_result;
   switch (ops_param->op_type) {
     case OperationType::ALLREDUCE:
+      ReduceOp reduce_op = static_cast<ReduceOp>(ops_params->reduce_op_int);
       enqueue_result = EnqueueTensorAllreduces(
           hvd_contexts, hvd_cpu_buffers, hvd_cpu_buffers, ready_events, ops_param->op_names, device,
-          callbacks, (average) ? ReduceOp::AVERAGE : ReduceOp::SUM, prescale_factor, postscale_factor);
+          callbacks, reduce_op, prescale_factor, postscale_factor);
       break;
     case OperationType::ALLGATHER:
       enqueue_result = EnqueueTensorAllgather(
@@ -349,7 +351,7 @@ void DoHorovodOperationCudaOnCPU(void*, void* on_complete_ptr, void* param) {
 inline void PushHorovodOperationCudaOnCPU(OperationType op_type, NDArray* const * inputs,
                                           NDArray* const * outputs, const char* name,
                                           int priority, int num_tensors, int root_rank = -1,
-                                          bool average = true,
+                                          int divisor, int reduce_op_int,
                                           NDArray* splits = nullptr,
                                           NDArray* output_received_splits = nullptr,
                                           double prescale_factor = 1.0,
@@ -406,7 +408,7 @@ inline void PushHorovodOperationCudaOnCPU(OperationType op_type, NDArray* const 
 
   auto ops_param = CreateMpiOpsParam(std::move(input_copies), std::move(output_copies),
     std::move(outputs_vec), cpu_input_tensors, cpu_output_tensors, op_type, std::move(op_names), root_rank,
-    average, splits_tensor, received_splits_tensor, prescale_factor, postscale_factor);
+    divisor, reduce_op_int, splits_tensor, received_splits_tensor, prescale_factor, postscale_factor);
 
   std::vector<void*> cpu_input_vars;
   std::vector<void*> cpu_output_vars;
@@ -454,7 +456,9 @@ inline void PushHorovodOperationCudaOnCPU(OperationType op_type, NDArray* const 
 
 extern "C" int horovod_mxnet_allreduce_async(NDArray* const * inputs,
                                              NDArray* const * outputs,
-                                             const char* name, bool average,
+                                             int divisor,
+                                             const char* name,
+                                             int reduce_op_int,
                                              int priority,
                                              double prescale_factor,
                                              double postscale_factor,
@@ -464,28 +468,28 @@ extern "C" int horovod_mxnet_allreduce_async(NDArray* const * inputs,
 #if HAVE_ROCM
   // Averaging left at framework level for ROCm until ScaleBuffer implementation
   // added.
-  bool average_in_framework = average;
-  average = false;
+  int average_in_framework = reduce_op_int;
 #endif
 
 #if HAVE_CUDA && !HOROVOD_GPU_ALLREDUCE
   if (IsTensorOnCPU(inputs[0]) && IsTensorOnCPU(outputs[0])) {
     PushHorovodOperation(OperationType::ALLREDUCE, inputs, outputs,
-                         name, priority, num_tensors, -1, average, nullptr, nullptr, prescale_factor, postscale_factor);
+                         name, priority, num_tensors, -1, divisor, reduce_op, nullptr, nullptr, prescale_factor, postscale_factor);
   } else {
     PushHorovodOperationCudaOnCPU(OperationType::ALLREDUCE, inputs, outputs,
-                                  name, priority, num_tensors, -1, average, nullptr, nullptr, prescale_factor, postscale_factor);
+                                  name, priority, num_tensors, -1, divisor, reduce_op, nullptr, nullptr, prescale_factor, postscale_factor);
   }
 #else
   PushHorovodOperation(OperationType::ALLREDUCE, inputs, outputs,
-                       name, priority, num_tensors, -1, average, nullptr,
+                       name, priority, num_tensors, -1, divisor, reduce_op, nullptr,
                        nullptr, prescale_factor, postscale_factor);
 #endif
 
 #if HAVE_ROCM
-  if (average_in_framework) {
+  if (average_in_framework == 0) {
     for (int i = 0; i < num_tensors; ++i) {
-      *outputs[i] /= horovod_size();
+//      *outputs[i] /= horovod_size();
+      *outputs[i] /= divisor;
     }
   }
 #endif

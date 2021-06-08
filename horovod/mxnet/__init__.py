@@ -30,6 +30,7 @@ from horovod.mxnet.mpi_ops import size, local_size, cross_size, rank, local_rank
 from horovod.mxnet.mpi_ops import mpi_threads_supported, mpi_enabled, mpi_built
 from horovod.mxnet.mpi_ops import gloo_enabled, gloo_built
 from horovod.mxnet.mpi_ops import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
+from horovod.mxnet.mpi_ops import Average, Adasum, Sum
 
 import mxnet as mx
 from collections import OrderedDict, defaultdict
@@ -102,38 +103,14 @@ class DistributedOptimizer(mx.optimizer.Optimizer):
         self._optimizer.set_wd_mult(args_wd_mult)
 
 
-# DistributedTrainer, a subclass of MXNet gluon.Trainer.
-# There are two differences between DistributedTrainer and Trainer:
-# 1. DistributedTrainer calculates gradients using Horovod allreduce
-#    API while Trainer does it using kvstore push/pull APIs;
-# 2. DistributedTrainer performs allreduce(summation) and average
-#    while Trainer only performs allreduce(summation).
-class DistributedTrainer(mx.gluon.Trainer):
-    """The distributed trainer for data parallel training.
-
-    Arguments:
-        params: dict of parameters to train
-        optimizer: mx.optim.Optimizer. the choice of optimizer
-        optimizer_params: hyper-parameter of the chosen optimizer
-        compression: Compression algorithm used during allreduce to reduce the amount
-                     of data sent during the each parameter update step.  Defaults to
-                     not using compression.
-        gradient_predivide_factor: gradient_predivide_factor splits the averaging
-              before and after the sum. Gradients are scaled by
-              1.0 / gradient_predivide_factor before the sum and
-              gradient_predivide_factor / size after the sum.
-        prefix: the prefix of the parameters this trainer manages.
-              If multiple trainers are used in the same program,
-              they must be specified by different prefixes to avoid tensor name collision.
-    """
+class _DistributedTrainer(mx.gluon.Trainer):
     def __init__(self, params, optimizer, optimizer_params=None,
-                 compression=Compression.none,
+                 compression=Compression.none, op=Average,
                  gradient_predivide_factor=1.0, prefix=None,
                  num_groups=0):
         self._compression = compression
+        self.op = op
 
-        if gradient_predivide_factor != 1.0 and rocm_built():
-            raise ValueError('gradient_predivide_factor not supported yet with ROCm')
         if isinstance(optimizer, DistributedOptimizer):
             optimizer = optimizer._optimizer
             warnings.warn("DistributedTrainer does not take DistributedOptimizer "
@@ -147,7 +124,7 @@ class DistributedTrainer(mx.gluon.Trainer):
         elif isinstance(params, (list, tuple)):
             params = sorted(params)
 
-        super(DistributedTrainer, self).__init__(
+        super(_DistributedTrainer, self).__init__(
             params, optimizer, optimizer_params=optimizer_params, kvstore=None)
 
         # _scale is used to check and set rescale_grad for optimizer in Trainer.step()
@@ -183,8 +160,8 @@ class DistributedTrainer(mx.gluon.Trainer):
                 for entries in entries_by_dtype.values():
                     grads, names = zip(*entries)
                     tensors_compressed, ctxs = zip(*[self._compression.compress(grad) for grad in grads])
-                    grouped_allreduce_(tensors=tensors_compressed, average=False, name="{}:{}".format(names[0], names[-1]), priority=-i,
-                                       prescale_factor=1.0 / self._gradient_predivide_factor)
+                    grouped_allreduce_(tensors=tensors_compressed, name="{}:{}".format(names[0], names[-1]), op=self.op, 
+                               priority=-i, prescale_factor=1.0 / self._gradient_predivide_factor)
                     grads = [self._compression.decompress(t, ctx) for t, ctx in zip(tensors_compressed, ctxs)]
         else:
             # In MXNet 2.0, param.name is no longer unique.
@@ -193,10 +170,111 @@ class DistributedTrainer(mx.gluon.Trainer):
             for i, param in enumerate(self._params):
                 if param.grad_req != 'null':
                     tensor_compressed, ctx = self._compression.compress(param.list_grad()[0])
-                    allreduce_(tensor_compressed, average=False,
-                               name=self._prefix + str(i), priority=-i,
-                               prescale_factor=1.0 / self._gradient_predivide_factor)
+                    allreduce_(tensor_compressed, name=self._prefix + str(i), op=self.op,
+                               priority=-i, prescale_factor=1.0 / self._gradient_predivide_factor)
                     param._grad[0][:] = self._compression.decompress(tensor_compressed, ctx)
+
+
+class _DistributedAdasumTrainer(mx.gluon.Trainer):
+    def __init__(self, params, optimizer, optimizer_params=None,
+                 compression=Compression.none, prefix=None):
+        self._compression = compression
+
+        if isinstance(optimizer, DistributedOptimizer):
+            optimizer = optimizer._optimizer
+            warnings.warn("DistributedTrainer does not take DistributedOptimizer "
+                          "as its optimizer. We have unwrapped it for you.")
+
+        # To ensure consistent parameter ordering across workers, sort params before
+        # passing to base Trainer constructor. This logic is consistent with trainer.py
+        # since v1.6 but we do it here for backwards compatability
+        if isinstance(params, dict):
+            params = OrderedDict(params)
+        elif isinstance(params, (list, tuple)):
+            params = sorted(params)
+
+        super(_DistributedAdasumTrainer, self).__init__(
+            params, optimizer, optimizer_params=optimizer_params, kvstore=None)
+        assert prefix is None or isinstance(prefix, str)
+        self._prefix = prefix if prefix else ""
+
+    def step(self, batch_size, ignore_stale_grad=False):
+        super(_DistributedAdasumTrainer, self).step(batch_size, ignore_stale_grad)
+
+    def _allreduce_grads(self):
+        if size() == 1: return
+
+        # Delta optimizer implements this logic:
+        #  start = current.copy()
+        #  step() -> computes 'current - \alpha.f(g)' where f is
+        #            optimizer logic and g is the gradient
+        #  delta = current-start
+        #  allreduce_(delta)
+        #  start += delta
+        #  current = start
+        # In order to suppport this logic using function hook to improve performance,
+        # we do:
+        # delta = (start - \alpha.f(g)) - start
+        #       = -\alpha.f(g)
+        # set start to zero and step computes -\alpha.f(g)
+        # where f is the underlying optimizer logic
+
+        # In MXNet 2.0, param.name is no longer unique.
+        # Meanwhile, since horovod requires Python 3.6, there is no need to sort
+        # self._params as enumerating a python dict is always deterministic.
+        start = self._params
+        step(self, ignore_stale_grad=True)
+
+        for i, param in enumerate(self._params):
+            if param.grad_req != 'null':
+                tensor_compressed, ctx = self._compression.compress(param.list_grad()[0])
+                allreduce_(tensor_compressed, name=self._prefix + str(i), op=Adasum, priority=-i)
+                param._grad[0][:] = self._compression.decompress(tensor_compressed, ctx)
+
+
+# DistributedTrainer, a subclass of MXNet gluon.Trainer.
+# There are two differences between DistributedTrainer and Trainer:
+# 1. DistributedTrainer calculates gradients using Horovod allreduce
+#    API while Trainer does it using kvstore push/pull APIs;
+# 2. DistributedTrainer performs allreduce(summation) and average
+#    while Trainer only performs allreduce(summation).
+def DistributedTrainer(params, optimizer, optimizer_params=None,
+                         compression=Compression.none, op=Average,
+                         gradient_predivide_factor=1.0, prefix=None,
+                         num_groups=0):
+    """The distributed trainer for data parallel training.
+
+    Arguments:
+        params: dict of parameters to train
+        optimizer: mx.optim.Optimizer. the choice of optimizer
+        optimizer_params: hyper-parameter of the chosen optimizer
+        compression: Compression algorithm used during allreduce to reduce the amount
+                     of data sent during the each parameter update step.  Defaults to
+                     not using compression.
+        op: The reduction operation to use when combining gradients across different ranks.
+        gradient_predivide_factor: If op == Average, gradient_predivide_factor splits the averaging
+                                   before and after the sum. Gradients are scaled by
+                                   1.0 / gradient_predivide_factor before the sum and
+                                   gradient_predivide_factor / size after the sum.
+        prefix: the prefix of the parameters this trainer manages.
+              If multiple trainers are used in the same program,
+              they must be specified by different prefixes to avoid tensor name collision.
+    """
+    if gradient_predivide_factor != 1.0:
+        if rocm_built():
+            raise ValueError('gradient_predivide_factor not supported yet with ROCm')
+        if op != Average:
+            raise ValueError('gradient_predivide_factor not supported with op != Average')
+
+    if op != Adasum or size() == 1:
+        cls = type(params.__class__.__name__, (params.__class__,),
+                   dict(_DistributedTrainer.__dict__))
+        return cls(params, optimizer, optimizer_params, compression, op,
+                   gradient_predivide_factor, prefix, num_groups)
+    else:
+        cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
+                   dict(_DistributedAdasumTrainer.__dict__))
+        return cls(params, optimizer, optimizer_params, compression, prefix)
 
 
 # Wrapper to inject Horovod broadcast after parameter initialization

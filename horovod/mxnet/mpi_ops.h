@@ -105,7 +105,9 @@ void DeleteMpiOpsParam(void* param) {
 
 extern "C" int horovod_mxnet_allreduce_async(NDArray* const * inputs,
                                              NDArray* const * outputs,
-                                             const char* name, bool average,
+                                             int divisor,
+                                             const char* name,
+                                             int reduce_op_int,
                                              int priority,
                                              double prescale_factor,
                                              double postscale_factor,

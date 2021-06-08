@@ -19,12 +19,14 @@ from collections import defaultdict
 # Load all the necessary MXNet C types.
 import ctypes
 import os
+import warnings
 
 import mxnet as mx
 from mxnet.base import c_handle_array, c_str, c_str_array, check_call, string_types
 
 from horovod.common.util import check_installed_version, get_ext_suffix
 from horovod.common.basics import HorovodBasics as _HorovodBasics
+from horovod.common.util import get_average_backwards_compatibility_fun, gpu_available, num_rank_is_power_2
 
 # Check possible symbol not found error from mxnet version mismatch
 try:
@@ -58,12 +60,21 @@ ccl_built = _basics.ccl_built
 cuda_built = _basics.cuda_built
 rocm_built = _basics.rocm_built
 
+# import reduction op values
+Average = _basics.Average
+Sum = _basics.Sum
+Adasum = _basics.Adasum
+
+is_homogeneous = _basics.is_homogeneous
+
+handle_average_backwards_compatibility = get_average_backwards_compatibility_fun(_basics)
+
 dll_path = os.path.join(os.path.dirname(__file__),
                         'mpi_lib' + get_ext_suffix())
 MPI_MXNET_LIB_CTYPES = ctypes.CDLL(dll_path, ctypes.RTLD_GLOBAL)
 
 
-def allreduce(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
+def allreduce(tensor, average=None, name=None, op=None, priority=0, prescale_factor=1.0,
               postscale_factor=1.0):
     """
     A function that performs averaging or summation of the input tensor over
@@ -79,10 +90,15 @@ def allreduce(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
     to be computed and backpropagated.
 
     Arguments:
-        tensor: A tensor to average or sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
+        tensor: A tensor to reduce
+        average:
+            .. warning:: .. deprecated:: 0.19.0
+
+                Use `op` instead. Will be removed in v0.21.0.
+
         name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different ranks. Defaults
+            to Average if None is given.
         priority: The priority of this operation. Higher priority operations
                   are likely to be executed before other operations.
         prescale_factor: Multiplicative factor to scale tensor before allreduce
@@ -92,6 +108,41 @@ def allreduce(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
         A tensor of the same shape and type as `tensor`, averaged or summed
         across all processes.
     """
+    # Set the divisor for reduced gradients to average when necessary
+    op = handle_average_backwards_compatibility(op, average)
+    op = handle_average_backwards_compatibility(op, average)
+    if op == Average:
+        if rocm_built():
+            # For ROCm, perform averaging at framework level
+            divisor = size()
+            op = Sum
+        else:
+            divisor = 1
+
+    elif op == Adasum:
+        if tensor.device.type != 'cpu' and gpu_available('mxnet'):
+            if nccl_built():
+                if not is_homogeneous():
+                    raise NotImplementedError('Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                elif not num_rank_is_power_2(int(size() / local_size())):
+                    raise NotImplementedError('Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                if rocm_built():
+                    # For ROCm, perform averaging at framework level
+                    divisor = local_size()
+                else:
+                    divisor = 1
+            else:
+                warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors are '
+                              'copied to CPU memory instead. To use Adasum for GPU reduction, please compile Horovod '
+                              'with HOROVOD_GPU_OPERATIONS=NCCL.')
+                divisor = 1
+        else:
+            if not num_rank_is_power_2(size()):
+                raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+            divisor = 1
+    else:
+        divisor = 1
+
     output = mx.nd.zeros(shape=tensor.shape, ctx=tensor.context,
                          dtype=tensor.dtype)
 
@@ -100,7 +151,7 @@ def allreduce(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
     c_name = c_str(name) if isinstance(name, string_types) else ctypes.c_char_p(None)
 
     check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
-        ctypes.byref(c_in), ctypes.byref(c_out), c_name, ctypes.c_bool(average),
+        ctypes.byref(c_in), ctypes.byref(c_out), ctypes.c_int(divisor), c_name, ctypes.c_int(op),
         ctypes.c_int(priority),
         ctypes.c_double(prescale_factor),
         ctypes.c_double(postscale_factor), ctypes.c_int(1)))
@@ -108,7 +159,7 @@ def allreduce(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
     return output
 
 
-def allreduce_(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
+def allreduce_(tensor, average=None, name=None, op=None, priority=0, prescale_factor=1.0,
               postscale_factor=1.0):
     """
     A function that performs in-place averaging or summation of the input
@@ -120,10 +171,15 @@ def allreduce_(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
     start until all processes are ready to send and receive the tensor.
 
     Arguments:
-        tensor: A tensor to average or sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
+        tensor: A tensor to reduce.
+        average:
+            .. warning:: .. deprecated:: 0.19.0
+
+                Use `op` instead. Will be removed in v0.21.0.
+
         name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different
+                   ranks. Defaults to Average if None is given.
         priority: The priority of this operation. Higher priority operations
                   are likely to be executed before other operations.
         prescale_factor: Multiplicative factor to scale tensor before allreduce
@@ -134,12 +190,46 @@ def allreduce_(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
         across all processes.
     """
 
+    # Set the divisor for reduced gradients to average when necessary
+    op = handle_average_backwards_compatibility(op, average)
+    if op == Average:
+        if rocm_built():
+            # For ROCm, perform averaging at framework level
+            divisor = size()
+            op = Sum
+        else:
+            divisor = 1
+
+    elif op == Adasum:
+        if tensor.device.type != 'cpu' and gpu_available('torch'):
+            if nccl_built():
+                if not is_homogeneous():
+                    raise NotImplementedError('Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                elif not num_rank_is_power_2(int(size() / local_size())):
+                    raise NotImplementedError('Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                if rocm_built():
+                    # For ROCm, perform averaging at framework level
+                    divisor = local_size()
+                else:
+                    divisor = 1
+            else:
+                warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors are '
+                              'copied to CPU memory instead. To use Adasum for GPU reduction, please compile Horovod '
+                              'with HOROVOD_GPU_OPERATIONS=NCCL.')
+                divisor = 1
+        else:
+            if not num_rank_is_power_2(size()):
+                raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+            divisor = 1
+    else:
+        divisor = 1
+
     c_in = tensor.handle
     c_out = tensor.handle
     c_name = c_str(name) if isinstance(name, string_types) else ctypes.c_char_p(None)
 
     check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
-        ctypes.byref(c_in), ctypes.byref(c_out), c_name, ctypes.c_bool(average),
+        ctypes.byref(c_in), ctypes.byref(c_out), c_name, ctypes.c_int(divisor), ctypes.c_int(op),
         ctypes.c_int(priority),
         ctypes.c_double(prescale_factor),
         ctypes.c_double(postscale_factor),
@@ -147,7 +237,7 @@ def allreduce_(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
 
     return tensor
 
-def grouped_allreduce(tensors, average=True, name=None, priority=0, prescale_factor=1.0,
+def grouped_allreduce(tensors, average=None, name=None, op=None, priority=0, prescale_factor=1.0,
               postscale_factor=1.0):
     """
     A function that performs averaging or summation of the input
@@ -161,10 +251,15 @@ def grouped_allreduce(tensors, average=True, name=None, priority=0, prescale_fac
     processes are ready to send and receive the tensors.
 
     Arguments:
-        tensors: A list of tensors to average or sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
-        name: A base name to use for the group reduction operation
+        tensor: A tensor to reduce.
+        average:
+            .. warning:: .. deprecated:: 0.19.0
+
+                Use `op` instead. Will be removed in v0.21.0.
+
+        name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different ranks. Defaults to
+            Average if None is given.
         priority: The priority of this operation. Higher priority operations
                   are likely to be executed before other operations.
         prescale_factor: Multiplicative factor to scale tensor before allreduce
@@ -178,6 +273,39 @@ def grouped_allreduce(tensors, average=True, name=None, priority=0, prescale_fac
     if not tensors:
       return tensors
 
+    # Set the divisor for reduced gradients to average when necessary
+    op = handle_average_backwards_compatibility(op, average)
+    if op == Average:
+        if rocm_built():
+            # For ROCm, perform averaging at framework level
+            divisor = size()
+            op = Sum
+        else:
+            divisor = 1
+    elif op == Adasum:
+        if tensors[0].device.type != 'cpu' and gpu_available('torch'):
+            if nccl_built():
+                if not is_homogeneous():
+                    raise NotImplementedError('Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                elif not num_rank_is_power_2(int(size() / local_size())):
+                    raise NotImplementedError('Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                if rocm_built():
+                    # For ROCm, perform averaging at framework level
+                    divisor = local_size()
+                else:
+                    divisor = 1
+            else:
+                warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors are '
+                              'copied to CPU memory instead. To use Adasum for GPU reduction, please compile Horovod '
+                              'with HOROVOD_GPU_OPERATIONS=NCCL.')
+                divisor = 1
+        else:
+            if not num_rank_is_power_2(size()):
+                raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+            divisor = 1
+    else:
+        divisor = 1
+
     outputs = [mx.nd.zeros(shape=tensor.shape, ctx=tensor.context,
                          dtype=tensor.dtype) for tensor in tensors]
 
@@ -186,7 +314,7 @@ def grouped_allreduce(tensors, average=True, name=None, priority=0, prescale_fac
     c_name = c_str(name) if isinstance(name, string_types) else ctypes.c_char_p(None)
 
     check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
-        c_in, c_out, c_name, ctypes.c_bool(average),
+        c_in, c_out, c_name, ctypes.c_int(divisor), ctypes.c_int(op),
         ctypes.c_int(priority),
         ctypes.c_double(prescale_factor),
         ctypes.c_double(postscale_factor),
@@ -194,7 +322,7 @@ def grouped_allreduce(tensors, average=True, name=None, priority=0, prescale_fac
 
     return outputs
 
-def grouped_allreduce_(tensors, average=True, name=None, priority=0, prescale_factor=1.0,
+def grouped_allreduce_(tensors, average=None, name=None, op=None, priority=0, prescale_factor=1.0,
               postscale_factor=1.0):
     """
     A function that performs in-place averaging or summation of the input
@@ -208,10 +336,15 @@ def grouped_allreduce_(tensors, average=True, name=None, priority=0, prescale_fa
     processes are ready to send and receive the tensors.
 
     Arguments:
-        tensors: A list of tensors to average or sum.
-        average: A flag indicating whether to compute average or summation,
-                 defaults to average.
-        name: A base name to use for the group reduction operation
+        tensor: A tensor to reduce.
+        average:
+            .. warning:: .. deprecated:: 0.19.0
+
+                Use `op` instead. Will be removed in v0.21.0.
+
+        name: A name of the reduction operation.
+        op: The reduction operation to combine tensors across different ranks. Defaults to
+            Average if None is given.
         priority: The priority of this operation. Higher priority operations
                   are likely to be executed before other operations.
         prescale_factor: Multiplicative factor to scale tensor before allreduce
@@ -225,12 +358,45 @@ def grouped_allreduce_(tensors, average=True, name=None, priority=0, prescale_fa
     if not tensors:
       return tensors
 
+    # Set the divisor for reduced gradients to average when necessary
+    op = handle_average_backwards_compatibility(op, average)
+    if op == Average:
+        if rocm_built():
+            # For ROCm, perform averaging at framework level
+            divisor = size()
+            op = Sum
+        else:
+            divisor = 1
+    elif op == Adasum:
+        if tensors[0].device.type != 'cpu' and gpu_available('torch'):
+            if nccl_built():
+                if not is_homogeneous():
+                    raise NotImplementedError('Running GPU Adasum on heterogeneous cluster is not supported yet.')
+                elif not num_rank_is_power_2(int(size() / local_size())):
+                    raise NotImplementedError('Running GPU Adasum with non-power of 2 nodes is not supported yet.')
+                if rocm_built():
+                    # For ROCm, perform averaging at framework level
+                    divisor = local_size()
+                else:
+                    divisor = 1
+            else:
+                warnings.warn('Adasum reduction does not currently support GPU reduction using MPI. Tensors are '
+                              'copied to CPU memory instead. To use Adasum for GPU reduction, please compile Horovod '
+                              'with HOROVOD_GPU_OPERATIONS=NCCL.')
+                divisor = 1
+        else:
+            if not num_rank_is_power_2(size()):
+                raise NotImplementedError('Running Adasum with non-power of 2 ranks is not supported yet.')
+            divisor = 1
+    else:
+        divisor = 1
+
     c_in = c_handle_array(tensors)
     c_out = c_handle_array(tensors)
     c_name = c_str(name) if isinstance(name, string_types) else ctypes.c_char_p(None)
 
     check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
-        c_in, c_out, c_name, ctypes.c_bool(average),
+        c_in, c_out, c_name, ctypes.c_int(divisor), ctypes.c_int(op),
         ctypes.c_int(priority),
         ctypes.c_double(prescale_factor),
         ctypes.c_double(postscale_factor),
